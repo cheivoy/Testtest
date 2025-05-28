@@ -1,0 +1,1094 @@
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import Tesseract from 'tesseract.js';
+import { SYSTEM_CONSTANTS, toNum, calculateDamage, generateDefenseChartData, generateAttackChartData } from './utils.js';
+
+const ImageUploader = ({ setInputs, type }) => {
+  const [images, setImages] = React.useState([]);
+  const [progress, setProgress] = React.useState(0);
+  const [error, setError] = React.useState('');
+
+  const preprocessImage = (image, callback) => {
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    const img = new Image();
+    img.onload = () => {
+      canvas.width = img.width;
+      canvas.height = img.height;
+      ctx.drawImage(img, 0, 0);
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const data = imageData.data;
+      let sum = 0;
+      for (let i = 0; i < data.length; i += 4) {
+        const avg = (data[i] + data[i + 1] + data[i + 2]) / 3;
+        sum += avg;
+      }
+      const threshold = sum / (data.length / 4) > 128 ? 128 : sum / (data.length / 4);
+      for (let i = 0; i < data.length; i += 4) {
+        const avg = (data[i] + data[i + 1] + data[i + 2]) / 3;
+        const value = avg > threshold ? 255 : 0;
+        data[i] = data[i + 1] = data[i + 2] = value;
+      }
+      ctx.putImageData(imageData, 0, 0);
+      callback(canvas.toDataURL());
+    };
+    img.src = URL.createObjectURL(image);
+  };
+
+  const parseText = (text, type) => {
+    const values = {};
+    const regex = /([\u4e00-\u9fa5]+[\u4e00-\u9fa5\s：:]*)\s*[:：]*\s*([\d.,\/%-]+(?:\s*[-–—]\s*\d+)?)/g;
+    let match;
+    const unmatched = [];
+
+    while ((match = regex.exec(text)) !== null) {
+      const label = match[1].trim().replace(/\s+/g, '');
+      let value = match[2].replace(/[,]/g, '').replace('%', '');
+
+      if (type === 'attacker') {
+        if (label.includes('技能倍率')) values.skill_multiplier = value;
+        if (label.includes('攻擊') && !label.includes('元素攻擊') && !label.includes('攻擊%')) {
+          const [low] = value.split(/[-–—]/).map(Number);
+          values.D = low.toString();
+        }
+        if (label.includes('元素攻擊')) values.E = value;
+        if (label.includes('會心數值')) values.b_c = value;
+        if (label.includes('會心傷害')) values.d_c = (parseFloat(value) / 100).toString();
+        if (label.includes('流派克制') && !label.includes('流派克制%')) {
+          const [baseValue] = value.split('/').map(v => v.trim());
+          values.R = baseValue;
+        }
+        if (label.includes('流派克制%')) {
+          const [, percentValue] = value.split('/').map(v => parseFloat(v));
+          values.flow_percent = (percentValue / 100).toString();
+        }
+        if (label.includes('命中')) values.h = value;
+        if (label.includes('破防')) values.b_d = value;
+        if (label.includes('破盾')) values.b_s = value;
+        if (label.includes('忽視元素抗性')) values.b_e = value;
+        if (label.includes('增傷')) values.damage_increase = (parseFloat(value) / 100).toString();
+        if (label.includes('技能增傷')) values.skill_damage_increase = (parseFloat(value) / 100).toString();
+        if (label.includes('金周天')) {
+          if (value.includes('1級') || value.includes('1')) values.gold_i = '0.03';
+          else if (value.includes('2級') || value.includes('2')) values.gold_i = '0.04';
+          else if (value.includes('3級') || value.includes('3')) values.gold_i = '0.05';
+          else values.gold_i = '0';
+        }
+      } else if (type === 'defender') {
+        if (label.includes('氣血')) values.hp = value.split('/')[0];
+        if (label.includes('防禦')) values.d_d = value;
+        if (label.includes('抗會心數值')) values.b_c_defense = value;
+        if (label.includes('會心防禦')) values.d_c_defense = (parseFloat(value) / 100).toString();
+        if (label.includes('格擋')) values.b_b = value;
+        if (label.includes('元素抗性')) values.d_e = value;
+        if (label.includes('傷害減免')) values.damage_reduction = (parseFloat(value) / 100).toString();
+        if (label.includes('流派抵禦') && !label.includes('流派抵禦%')) {
+          const [baseValue] = value.split('/').map(v => v.trim());
+          values.d_f = baseValue;
+        }
+        if (label.includes('流派抵禦%')) {
+          const [, percentValue] = value.split('/').map(v => parseFloat(v));
+          values.flow_resist_percent = (percentValue / 100).toString();
+        }
+        if (label.includes('氣盾')) values.d_s = value;
+        if (label.includes('技能減免')) values.skill_damage_reduction = (parseFloat(value) / 100).toString();
+      } else if (type === 'healing') {
+        if (label.includes('治療強度')) values.healing_power_equip = value;
+        if (label.includes('治療加成')) values.healing_percent = (parseFloat(value) / 100).toString();
+      }
+    }
+
+    const lines = text.split('\n');
+    lines.forEach(line => {
+      if (line.trim() && !regex.test(line)) unmatched.push(line);
+    });
+    if (unmatched.length > 0) console.warn('Unmatched OCR text:', unmatched);
+
+    return values;
+  };
+
+  const handleImageUpload = async (e) => {
+    const files = Array.from(e.target.files).slice(0, 3);
+    if (files.length > 3) {
+      setError('最多只能上傳3張圖片');
+      return;
+    }
+    setImages(files);
+    setProgress(0);
+    setError('');
+
+    try {
+      const results = await Promise.all(
+        files.map(async (file, index) => {
+          const progressIncrement = 100 / files.length;
+          return new Promise((resolve) => {
+            preprocessImage(file, async (processedImage) => {
+              const { data: { text } } = await Tesseract.recognize(processedImage, 'chi_tra', {
+                logger: (m) => {
+                  if (m.status === 'recognizing text') {
+                    setProgress((prev) => prev + (m.progress * progressIncrement));
+                  }
+                },
+              });
+              resolve(parseText(text, type));
+            });
+          });
+        })
+      );
+
+      const mergedValues = results.reduce((acc, curr) => ({ ...acc, ...curr }), {});
+      setInputs((prev) => ({ ...prev, ...mergedValues }));
+      setProgress(100);
+    } catch (err) {
+      console.error('OCR Error:', err);
+      setError('圖片解析失敗，請檢查圖片質量或重試');
+    }
+  };
+
+  return (
+    <div className="mb-4">
+      <label className="block text-sm font-medium text-gray-700 mb-2">上傳屬性截圖（最多3張，僅支持PNG/JPG）</label>
+      <input
+        type="file"
+        accept="image/png, image/jpeg"
+        multiple
+        onChange={handleImageUpload}
+        className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-cherry-50 file:text-cherry-700 hover:file:bg-cherry-100"
+        aria-label="上傳屬性截圖"
+      />
+      {progress > 0 && progress < 100 && (
+        <div className="mt-2">
+          <div className="w-full bg-gray-200 rounded-full h-2.5">
+            <div className="bg-cherry-500 h-2.5 rounded-full" style={{ width: `${progress}%` }}></div>
+          </div>
+          <p className="text-sm text-gray-600 mt-1">解析進度：{progress.toFixed(0)}%</p>
+        </div>
+      )}
+      {error && <p className="text-sm text-red-600 mt-2">{error}</p>}
+      {images.length > 0 && (
+        <div className="mt-4 grid grid-cols-3 gap-2">
+          {images.map((image, index) => (
+            <img key={index} src={URL.createObjectURL(image)} alt={`預覽 ${index + 1}`} className="w-full h-24 object-cover rounded-md" />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const DamageCalculator = () => {
+  const [inputs, setInputs] = React.useState({
+    skill_multiplier: "1518",
+    D: "5000",
+    E: "800",
+    b_c: "900",
+    d_c: "1.8",
+    R: "500",
+    h: "700",
+    b_d: "2000",
+    b_s: "700",
+    b_e: "0",
+    flow_percent: "0",
+    damage_increase: "0",
+    skill_damage_increase: "0",
+    d_s: "2000",
+    d_f: "2000",
+    d_d: "5000",
+    d_e: "0",
+    b_b: "600",
+    hp: "80000",
+    b_c_defense: "550",
+    d_c_defense: "0",
+    flow_resist_percent: "0",
+    damage_reduction: "0",
+    skill_damage_reduction: "0",
+    lambda_1: SYSTEM_CONSTANTS.lambda_1.toString(),
+    lambda_2: SYSTEM_CONSTANTS.lambda_2.toString(),
+    lambda_3: SYSTEM_CONSTANTS.lambda_3.toString(),
+    lambda_4: SYSTEM_CONSTANTS.lambda_4.toString(),
+    W: "1",
+    gold_i: "0"
+  });
+  const [inputErrors, setInputErrors] = React.useState({});
+  const [previousResult, setPreviousResult] = React.useState(null);
+  const [previousInputs, setPreviousInputs] = React.useState(null);
+
+  const goldOptions = [
+    { value: "0", label: "無金周天" },
+    { value: "0.03", label: "金周天1級" },
+    { value: "0.04", label: "金周天2級" },
+    { value: "0.05", label: "金周天3級" },
+  ];
+
+  const elementWeaknessOptions = [
+    { value: "1", label: "無元素弱點" },
+    { value: "1.5", label: "有元素弱點" },
+  ];
+
+  const handleChange = (e) => {
+    const { name, value } = e.target;
+    if (name === 'gold_i' || name === 'W') {
+      setInputs((prev) => ({ ...prev, [name]: value }));
+      setInputErrors((prev) => ({ ...prev, [name]: '' }));
+    } else {
+      if (value === '') {
+        setInputs((prev) => ({ ...prev, [name]: '0' }));
+        setInputErrors((prev) => ({ ...prev, [name]: '' }));
+        return;
+      }
+      const numValue = parseFloat(value);
+      if (isNaN(numValue)) {
+        setInputErrors((prev) => ({ ...prev, [name]: '請輸入有效數字' }));
+        return;
+      }
+      if (numValue < 0) {
+        setInputErrors((prev) => ({ ...prev, [name]: '輸入值不能為負數' }));
+        return;
+      }
+      if (numValue > 100000) {
+        setInputErrors((prev) => ({ ...prev, [name]: '輸入值過大，最大為100000' }));
+        return;
+      }
+      if (['flow_percent', 'damage_increase', 'skill_damage_increase', 'd_c_defense', 'flow_resist_percent', 'damage_reduction', 'skill_damage_reduction'].includes(name)) {
+        if (numValue < 0 || numValue > 1) {
+          setInputErrors((prev) => ({ ...prev, [name]: '百分比值必須在0到1之間' }));
+          return;
+        }
+      }
+      setInputs((prev) => ({ ...prev, [name]: value }));
+      setInputErrors((prev) => ({ ...prev, [name]: '' }));
+    }
+  };
+
+  const saveCurrentResult = () => {
+    setPreviousResult(calculateDamage(inputs));
+    setPreviousInputs({ ...inputs });
+  };
+
+  const CustomTooltip = ({ active, payload, label, isDelta }) => {
+    if (active && payload && payload.length) {
+      return (
+        <div className="bg-white p-3 border border-gray-200 rounded-lg shadow-sm">
+          <p className="text-sm text-gray-700 font-medium">屬性點: {label}</p>
+          {payload.map((entry, index) => (
+            <p key={index} className="text-sm text-gray-600">
+              <span style={{ color: entry.stroke }}>{entry.name}</span>: {(entry.value * 100).toFixed(isDelta ? 4 : 2)}%
+            </p>
+          ))}
+        </div>
+      );
+    }
+    return null;
+  };
+
+  const result = calculateDamage(inputs);
+  const { deltaData, reductionData } = generateDefenseChartData(inputs);
+
+  return (
+    <div className="p-4 container mx-auto min-h-screen">
+      <div className="cherry-gradient rounded-xl p-6 mb-6 shadow-lg">
+        <h1 className="text-xl md:text-2xl font-bold text-center text-white">防守計算器</h1>
+        <p className="text-center text-white text-opacity-90 text-sm mt-1">如有問題請聯繫櫻桃白蘭地@緣定今生</p>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+        <div className="bg-white p-4 md:p-6 rounded-xl shadow-md border border-gray-100">
+          <div className="flex items-center mb-4">
+            <div className="w-1.5 h-5 rounded-full bg-cherry-500 mr-2"></div>
+            <h2 className="font-bold text-base md:text-lg text-gray-800">攻擊方參數</h2>
+          </div>
+          <ImageUploader setInputs={setInputs} type="attacker" />
+          <div className="grid grid-cols-1 gap-3">
+            {[
+              { key: "skill_multiplier", label: "技能倍率", icon: "🔥", tooltip: "如技能倍率為300%，輸入300" },
+              { key: "D", label: "攻擊", icon: "⚔️" },
+              { key: "E", label: "元素攻擊（平均）", icon: "✨" },
+              { key: "b_c", label: "會心數值", icon: "🎯" },
+              { key: "d_c", label: "會心傷害", icon: "💥", tooltip: "除以100，例如180%，輸入1.8" },
+              { key: "R", label: "流派克制", icon: "🔄" },
+              { key: "h", label: "命中", icon: "🎯" },
+              { key: "b_d", label: "破防", icon: "🛡️" },
+              { key: "b_s", label: "破盾", icon: "🔨" },
+              { key: "b_e", label: "忽視元素抗性", icon: "🦠" },
+              { key: "flow_percent", label: "流派克制%", icon: "📊", tooltip: "例如9.5%，輸入0.095" },
+              { key: "damage_increase", label: "增傷%", icon: "📈", tooltip: "除以100，例如5%，輸入0.05" },
+              { key: "skill_damage_increase", label: "技能增傷%", icon: "📈", tooltip: "除以100，例如5%，輸入0.05" },
+              { key: "gold_i", label: "金周天", icon: "🌟", type: "select", options: goldOptions },
+              { key: "W", label: "元素弱點", icon: "🦋", type: "select", options: elementWeaknessOptions }
+            ].map(({ key, label, icon, type, options, tooltip }) => (
+              <div key={label} className="flex flex-col group relative">
+                <label className="text-xs md:text-sm text-gray-600 mb-1 flex items-center">
+                  <span className="mr-1 md:mr-2">{icon}</span>{label}
+                  {tooltip && (
+                    <>
+                      <span className="flex items-center justify-center w-4 h-4 rounded-full bg-gray-500 text-white text-xs cursor-pointer ml-2">?</span>
+                      <div className="tooltip-hidden absolute left-0 top-8 bg-cherry-50 text-cherry-700 text-xs p-2 rounded shadow-md z-10 max-w-xs">
+                        {tooltip}
+                      </div>
+                    </>
+                  )}
+                </label>
+                {type === "select" ? (
+                  <select
+                    name={key}
+                    value={inputs[key]}
+                    onChange={handleChange}
+                    className="input-focus border-gray-200 rounded-md p-2 text-sm w-full"
+                    aria-label={label}
+                  >
+                    {options.map(opt => (
+                      <option key={opt.value} value={opt.value}>{opt.label}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    type="number"
+                    name={key}
+                    value={inputs[key]}
+                    onChange={handleChange}
+                    min="0"
+                    max="100000"
+                    className={`input-focus border ${inputErrors[key] ? 'border-red-500' : 'border-gray-200'} rounded-md p-2 text-sm w-full`}
+                    aria-label={label}
+                  />
+                )}
+                {inputErrors[key] && (
+                  <p className="text-xs text-red-600 mt-1">{inputErrors[key]}</p>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="bg-white p-4 md:p-6 rounded-xl shadow-md border border-gray-100">
+          <div className="flex items-center mb-4">
+            <div className="w-1.5 h-5 rounded-full bg-cherry-500 mr-2"></div>
+            <h2 className="font-bold text-base md:text-lg text-gray-800">防守方參數</h2>
+          </div>
+          <ImageUploader setInputs={setInputs} type="defender" />
+          <div className="grid grid-cols-1 gap-3">
+            {[
+              { key: "d_s", label: "氣盾", icon: "🛡️" },
+              { key: "d_f", label: "流派抵抗", icon: "🔄" },
+              { key: "d_d", label: "防禦", icon: "🏰" },
+              { key: "d_e", label: "元素抵抗", icon: "🦠" },
+              { key: "b_b", label: "格擋", icon: "✋" },
+              { key: "hp", label: "氣血", icon: "❤️" },
+              { key: "b_c_defense", label: "抗會心數值", icon: "🎯" },
+              { key: "d_c_defense", label: "會心防禦%", icon: "📊", tooltip: "除以100，例如25%，輸入0.25" },
+              { key: "flow_resist_percent", label: "流派抵抗%", icon: "📊", tooltip: "除以100，例如5%，輸入0.05" },
+              { key: "damage_reduction", label: "傷害減免%", icon: "📉", tooltip: "除以100，例如15%，輸入0.15" },
+              { key: "skill_damage_reduction", label: "技能減免%", icon: "📉", tooltip: "除以100，例如5%，輸入0.05" }
+            ].map(({ key, label, icon, tooltip }) => (
+              <div key={label} className="flex flex-col group relative">
+                <label className="text-xs md:text-sm text-gray-600 mb-1 flex items-center">
+                  <span className="mr-1 md:mr-2">{icon}</span>{label}
+                  {tooltip && (
+                    <>
+                      <span className="flex items-center justify-center w-4 h-4 rounded-full bg-gray-500 text-white text-xs cursor-pointer ml-2">?</span>
+                      <div className="tooltip-hidden absolute left-0 top-8 bg-cherry-50 text-cherry-700 text-xs p-2 rounded shadow-md z-10 max-w-xs">
+                        {tooltip}
+                      </div>
+                    </>
+                  )}
+                </label>
+                <input
+                  type="number"
+                  name={key}
+                  value={inputs[key]}
+                  onChange={handleChange}
+                  min="0"
+                  max="100000"
+                  className={`input-focus border ${inputErrors[key] ? 'border-red-500' : 'border-gray-200'} rounded-md p-2 text-sm w-full`}
+                  aria-label={label}
+                />
+                {inputErrors[key] && (
+                  <p className="text-xs text-red-600 mt-1">{inputErrors[key]}</p>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="bg-white p-4 md:p-6 rounded-xl shadow-md border border-gray-100">
+          <div className="flex items-center mb-4">
+            <div className="w-1.5 h-5 rounded-full bg-cherry-500 mr-2"></div>
+            <h2 className="font-bold text-base md:text-lg text-gray-800">系統常數</h2>
+          </div>
+          <div className="grid grid-cols-1 gap-3">
+            {[
+              { key: "lambda_1", label: "系統常數 λ₁", icon: "🔢", value: SYSTEM_CONSTANTS.lambda_1 },
+              { key: "lambda_2", label: "系統常數 λ₂", icon: "🔢", value: SYSTEM_CONSTANTS.lambda_2 },
+              { key: "lambda_3", label: "系統常數 λ₃", icon: "🔢", value: SYSTEM_CONSTANTS.lambda_3 },
+              { key: "lambda_4", label: "系統常數 λ₄", icon: "🔢", value: SYSTEM_CONSTANTS.lambda_4 },
+            ].map(({ key, label, icon, value }) => (
+              <div key={label} className="flex flex-col">
+                <label className="text-xs md:text-sm text-gray-600 mb-1 flex items-center">
+                  <span className="mr-1 md:mr-2">{icon}</span>{label}
+                </label>
+                <input
+                  type="number"
+                  value={value}
+                  disabled
+                  className="border-gray-200 rounded-md p-2 text-sm bg-gray-100 w-full"
+                  aria-label={label}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="flex justify-center mb-6">
+        <button
+          onClick={saveCurrentResult}
+          className="bg-cherry-500 text-white font-bold py-2 px-6 rounded-md hover:bg-cherry-600 transition-colors"
+          aria-label="儲存當前結果"
+        >
+          儲存當前結果
+        </button>
+      </div>
+
+      <div className="bg-white p-4 md:p-6 rounded-xl shadow-md border border-gray-100 mb-6">
+        <h2 className="font-bold text-base md:text-lg text-gray-800 mb-4">計算結果</h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+          <div>
+            <h3 className="font-bold text-gray-700 mb-2">當前結果</h3>
+            <div className="space-y-2 text-sm">
+              <p>會心數值 (c): {result.c}</p>
+              <p>會心機率 (p_c): {result.p_c}</p>
+              <p>命中率 (r_h): {result.r_h}</p>
+              <p>格擋率 (r_b): {result.r_b}</p>
+              <p>會心實際機率 (p_h): {result.p_h}</p>
+              <p>會心傷害倍率 (m_c): {result.m_c}</p>
+              <p>總倍率 (d_mul): {result.d_mul}</p>
+              <p>氣盾影響值 (G): {result.G}</p>
+              <p>最終攻擊力 (A): {result.A}</p>
+              <p>防禦減免率 (γ): {result.gamma}</p>
+              <p>元素抗力 (β): {result.beta}</p>
+              <p>基礎傷害: {result.baseDamage}</p>
+              <p>最終傷害: {result.finalDamage}</p>
+              <p>總減傷率: {result.totalReduction}</p>
+              <p>有效血量 (EHP): {result.ehp}</p>
+              <p>基礎元素傷害: {result.base_elementalDamage}</p>
+              <p>最終元素傷害: {result.elementalDamage}</p>
+              <p>基礎元素傷害占比: {result.base_elementalDamagePrecentage}</p>
+              <p>最終元素傷害占比: {result.elementalDamagePrecentage}</p>
+            </div>
+          </div>
+          {previousResult && (
+            <div>
+              <h3 className="font-bold text-gray-700 mb-2">上次結果</h3>
+              <div className="space-y-2 text-sm">
+                <p>會心數值 (c): {previousResult.c}</p>
+                <p>會心率 (p_c): {previousResult.p_c}</p>
+                <p>命中率 (r_h): {previousResult.r_h}</p>
+                <p>格擋率 (r_b): {previousResult.r_b}</p>
+                <p>會計實際機率 (p_h): {previousResult.p_h}</p>
+                <p>會心傷害倍率 (m_c): {previousResult.m_c}</p>
+                <p>總倍率 (d_mul): {previousResult.d_mul}</p>
+                <p>氣盾影響值 (G): {previousResult.G}</p>
+                <p>最終攻擊力 (A): {previousResult.A}</p>
+                <p>防禦減免率 (γ): {previousResult.gamma}</p>
+                <p>元素抗力 (β): {previousResult.beta}</p>
+                <p>基礎傷害: {previousResult.baseDamage}</p>
+                <p>最終傷害: {previousResult.finalDamage}</p>
+                <p>總減傷率: {previousResult.totalReduction}</p>
+                <p>有效血量 (EHP): {previousResult.ehp}</p>
+                <p>基礎元素傷害: {previousResult.base_elementalDamage}</p>
+                <p>最終元素傷害: {previousResult.elementalDamage}</p>
+                <p>基礎元素傷害比: {previousResult.base_elementalDamagePrecentage}</p>
+                <p>最終元素傷害比: {previousResult.elementalDamagePrecentage}</p>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="bg-white p-4 md:p-6 rounded-md shadow-md border border-gray-100">
+        <h2 className="font-bold text-lg md:text-lg text-gray-800 mb-4">減傷率圖表</h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <h3 className="font-bold text-gray-700 mb-2">減傷效果</h3>
+            <ResponsiveContainer width="100%" height="40vh">
+              <LineChart data={deltaData} aria-label="減傷效果圖">
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="point" label={{ value: "屬性值", position: "below" }} />
+                <YAxis tickFormatter={(value) => `${(value * 100).toFixed(2)}%`} label={{ value: "減傷效果 (%)", angle: -90, position: "left" }} />
+                <Tooltip content={<CustomTooltip isDelta={true} />} />
+                <Legend />
+                <Line type="default" dataKey="ds" name="氣盾" stroke="#ff0000" />
+                <Line type="default" dataKey="dd" name="防禦" stroke="#ff0" />
+                <Line type="default" dataKey="df" name="流派抵抗" stroke="#00ff00" />
+                <Line type="default" dataKey="de" name="元素抵抗" stroke="#0ff" />
+                <Line type="default" dataKey="bb" name="格擋" stroke="#f0f" />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+          <div>
+            <h3 className="font-bold text-gray-700 mb-2">總計減傷率</h3>
+            <ResponsiveContainer width="100%" height="40vh">
+              <LineChart data={reductionData} aria-label="總計減傷率">
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="point" label={{ value: "屬性值", position: "below" }} />
+                <YAxis tickFormatter={(value) => `${(value * 100).toFixed(2)}%`} label={{ value: "總計減傷率 (%)", angle: -90, position: "left" }} />
+                <Tooltip content={<CustomTooltip isDelta={false} />} />
+                <Legend />
+                <Line type="default" dataKey="ds" name="氣盾" stroke="#f00" />
+                <Line type="default" dataKey="dd" name="防禦" stroke="#ff0" />
+                <Line type="default" dataKey="df" name="流派抵抗" stroke="#0f0" />
+                <Line type="default" dataKey="de" name="元素抵抗" stroke="#0ff" />
+                <Line type="default" dataKey="bb" name="格擋" stroke="#f0f" />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const DamageCalculator2 = () => {
+  const [inputs, setInputs] = React.useState({
+    skill_multiplier: "1518",
+    D: "0",
+    E: "800",
+    b_c: "0",
+    d_c: "1.8",
+    R: "0",
+    h: "500",
+    b_d: "0",
+    b_s: "0",
+    b_e: "0",
+    flow_percent: "0",
+    damage_increase: "0",
+    skill_damage_increase: "0",
+    d_s: "2000",
+    d_f: "2000",
+    d_d: "0",
+    d_e: "0",
+    b_b: "0",
+    hp: "80000",
+    b_c_defense: "0",
+    d_c_defense: "0",
+    flow_resist_percent: "0",
+    damage_reduction: "0",
+    skill_damage_reduction: "0",
+    lambda_1: SYSTEM_CONSTANTS.lambda_1.toString(),
+    lambda_2: SYSTEM_CONSTANTS.lambda_2.toString(),
+    lambda_3: "0",
+    lambda_4: "0",
+    W: "0",
+    gold_i: "0"
+  });
+  const [inputErrors, setInputErrors] = React.useState({});
+  const [previousResult, setPreviousResult] = React.useState(null);
+  const [previousInputs, setPreviousInputs] = React.useState(null);
+
+  const goldOptions = [
+    { value: "0", label: "無金屬" },
+    { value: "0.03", label: "金屬 1級" },
+    { value: "0.04", label: "金屬 2級" },
+    { value: "0.05", label: "金屬 3級" },
+  ];
+
+  const elementalDamageOptions = [
+    { value: "0", label: "無元素" },
+    { value: "1.5", label: "元素弱點" },
+  ];
+
+  const handleChange = (e) => {
+    const { name, value } = e.target;
+    if (name === 'gold_i' || name === 'W') {
+      setInputs((prev) => ({ ...prev, [name]: value }));
+      setInputErrors((prev) => ({ ...prev, [name]: '' }));
+    } else {
+      if (value === '') {
+        setInputs((prev) => ({ ...prev, [name]: '0' }));
+        setInputErrors((prev) => ({ ...prev, [name]: '' }));
+        return;
+      }
+      const numValue = parseFloat(value);
+      if (isNaN(numValue)) {
+        setInputErrors((prev) => ({ ...prev, [name]: '請輸入有效數字' }));
+        return;
+      }
+      if (numValue < 0) {
+        setInputErrors((prev) => ({ ...prev, [name]: '輸入值不能為負數' }));
+        return;
+      }
+      if (numValue > 100000) {
+        setInputErrors((prev) => ({ ...prev, [name]: '輸入值過大，最大為100000' }));
+        return;
+      }
+      if (['flow_percent', 'damage_increase', 'skill_damage_increase', 'd_c_defense', 'flow_resist_percent', 'damage_reduction', 'skill_damage_reduction'].includes(name)) {
+        if (numValue < 0 || numValue > 1) {
+          setInputErrors((prev) => ({ ...prev, [name]: '百分比值必須在0到1之間' }));
+          return;
+        }
+      }
+      setInputs((prev) => ({ ...prev, [name]: value }));
+      setInputErrors((prev) => ({ ...prev, [name]: '' }));
+    }
+  };
+
+  const saveCurrentResult = () => {
+    setPreviousResult(calculateDamage(inputs));
+    setPreviousInputs({ ...inputs });
+  };
+
+  const CustomTooltip = ({ active, payload, label, isDelta }) => {
+    if (active && payload && payload.length) {
+      return (
+        <div className="bg-white p-3 border rounded-lg shadow-sm">
+          <p className="text-sm text-gray-700 font-medium">屬性點: {label}</p>
+          {payload.map((entry, index) => (
+            <p key={index} className="text-sm text-gray-600">
+              <span style={{ color: entry.stroke }}>{entry.name}</span>: {(entry.value * 100).toFixed(isDelta ? 4 : 2)}%
+            </p>
+          ))}
+        </div>
+      );
+    }
+    return null;
+  };
+
+  const result = calculateDamage(inputs);
+  const { deltaData, cumulativeData } = generateAttackChartData(inputs);
+
+  return (
+    <div className="p-4 container mx-auto min-h-screen">
+      <div className="cherry-gradient rounded-xl p-6 mb-6 shadow-lg">
+        <h1 className="text-xl md:text-2xl font-bold text-center text-white">攻擊計算器</h1>
+        <p className="text-center text-white text-opacity-90 text-sm mt-1">如有問題請聯繫櫻桃白蘭地@永恆</p>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+        <div className="bg-white p-4 md:p-6 rounded-xl shadow-md border border-gray-100">
+          <div className="flex items-center mb-4">
+            <div className="w-1.5 h-5 rounded-full bg-cherry-500 mr-2"></div>
+            <h2 className="font-bold text-base md:text-lg text-gray-800">攻擊者參數</h2>
+          </div>
+          <ImageUploader setInputs={setInputs} type="attacker" />
+          <div className="grid grid-cols-1 gap-3">
+            {[
+              { key: "skill_multiplier", label: "技能倍率", icon: "🔥", tooltip: "如技能倍率100%，輸入100" },
+              { key: "D", label: "攻擊", icon: "⚔️" },
+              { key: "E", label: "元素攻擊", icon: "✩" },
+              { key: "b_c", label: "會心數值", icon: "🎯" },
+              { key: "d_c", label: "會心傷害", icon: "💥", tooltip: "除以100，例如180%，輸入1.8" },
+              { key: "R", label: "流派克制", icon: "🔄" },
+              { key: "h", label: "命中", icon: "🎯" },
+              { key: "b_d", label: "破防", icon: "🖌" },
+              { key: "b_s", label: "破盾", icon: "🔨" },
+              { key: "b_e", label: "忽視元素抵抗", icon: "🦠" },
+              { key: "flow_percent", label: "流派克制%", icon: "📊", tooltip: "例如9.5%，輸入0.095" },
+              { key: "damage_increase", label: "增傷%", icon: "📈", tooltip: "除以100，例如5%，輸入0.05" },
+              { key: "skill_damage_increase", label: "技能增傷%", icon: "📈", tooltip: "除以100，例如5%，輸入0.05" },
+              { key: "gold_i", label: "金屬", icon: "🌟", type: "select", options: goldOptions },
+              { key: "W", label: "元素傷害", icon: "🦋", type: "select", options: elementalDamageOptions }
+            ].map(({ key, label, icon, type, options, tooltip }) => (
+              <div key={label} className="flex flex-col group relative">
+                <label className="text-xs md:text-sm text-gray-600 mb-1 flex items-center">
+                  <span className="mr-2">{icon}</span>{label}
+                  {tooltip && (
+                    <>
+                      <span className="flex items-center justify-center w-4 h-4 rounded-full bg-gray-500 text-white text-xs cursor-pointer ml-2">?</span>
+                      <div className="tooltip-hidden absolute left-0 top-8 bg-cherry-50 text-cherry-700 text-xs p-2 rounded shadow-md z-10 max-w-xs">
+                        {tooltip}
+                      </div>
+                    </>
+                  )}
+                </label>
+                {type === "select" ? (
+                  <select
+                    name={key}
+                    value={inputs[key]}
+                    onChange={handleChange}
+                    className="input-focus border-gray-200 rounded-md p-2 text-sm w-full"
+                    aria-label={label}
+                  >
+                    {options.map(opt => (
+                      <option key={opt.value} value={opt.value}>{opt.label}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    type="number"
+                    name={key}
+                    value={inputs[key]}
+                    onChange={handleChange}
+                    min="0"
+                    max="100000"
+                    className={`input-focus border ${inputErrors[key] ? 'border-red-500' : 'border-gray-200'} rounded-md p-2 text-sm w-full`}
+                    aria-label={label}
+                  />
+                )}
+                {inputErrors[key] && (
+                  <p className="text-xs text-red-600 mt-1">{inputErrors[key]}</p>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="bg-white p-4 md:p-6 rounded-xl shadow-md border border-gray-100">
+          <div className="flex items-center mb-4">
+            <div className="w-1.5 h-5 rounded-full bg-cherry-500 mr-2"></div>
+            <h2 className="font-bold text-base md:text-lg text-gray-800">防守者參數</h2>
+          </div>
+          <ImageUploader setInputs={setInputs} type="defender" />
+          <div className="grid grid-cols-1 gap-3">
+            {[
+              { key: "d_s", label: "氣盾", icon: "🛡️" },
+              { key: "d_f", label: "流派抵抗", icon: "🔄" },
+              { key: "d_d", label: "防禦", icon: "🏰" },
+              { key: "d_e", label: "元素抵抗", icon: "🦠" },
+              { key: "b_b", label: "格擋", icon: "✋" },
+              { key: "hp", label: "氣血", icon: "❤️" },
+              { key: "b_c_defense", label: "抗會心數值", icon: "🎯" },
+              { key: "d_c_defense", label: "會心防禦%", icon: "📊", tooltip: "除以100，例如25%，輸入0.25" },
+              { key: "flow_resist_percent", label: "流派抵抗%", icon: "📊", tooltip: "除以100，例如5%，輸入0.05" },
+              { key: "damage_reduction", label: "傷害減免%", icon: "📉", tooltip: "除以100，例如15%，輸入0.15" },
+              { key: "skill_damage_reduction", label: "技能減免%", icon: "📉", tooltip: "除以100，例如5%，輸入0.05" }
+            ].map(({ key, label, icon, tooltip }) => (
+              <div key={label} className="flex flex-col group relative">
+                <label className="text-xs md:text-sm text-gray-600 mb-1 flex items-center">
+                  <span className="mr-2">{icon}</span>
+                  {label}
+                  {tooltip && (
+                    <>
+                      <span className="flex items-center justify-center w-4 h-4 rounded-full bg-gray-200 text-white text-xs cursor-pointer ml-2">
+                        ?
+                      </span>
+                      <div className="tooltip-content absolute left-0 top-8 bg-white text-gray-900 text-xs p-2 rounded shadow-md z-10 hidden group-hover:block max-w-xs">
+                        {tooltip}
+                      </div>
+                    </>
+                  )}
+                </label>
+                <input
+                  type="number"
+                  name={key}
+                  value={inputs[key]}
+                  onChange={handleChange}
+                  min="0"
+                  max="10000"
+                  className={`input-field border ${inputErrors[key] ? 'border-red-500' : 'border-gray-300'} rounded-md p-2 text-sm w-full`}
+                  aria-label={label}
+                />
+                {inputErrors[key] && (
+                  <p className="text-red-600 mt-1">{inputErrors[key]}</p>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="bg-white p-4 rounded-md shadow-md border-gray-100">
+          <div className="flex items-center mb-3">
+            <div className="w-2 h-5 rounded-full bg-red-500 mr-2"></div>
+            <h3 className="font-semibold text-base text-gray-800">系統參數</h3>
+          </div>
+          <div className="grid grid-cols-1 gap-2">
+            {[
+              { key: "lambda_1", label: "系統參數 λ₁", icon: "λ", value: SYSTEM_CONSTANTS.lambda_1 },
+              { key: "lambda_2", label: "系統參數 λ₂", icon: "λ", value: SYSTEM_CONSTANTS.lambda_2 },
+              { key: "lambda_3", label: "系統參數 λ₃", icon: "λ", value: SYSTEM_CONSTANTS.lambda_3 },
+              { key: "lambda_4", label: "系統參數 λ₄", icon: "λ", value: SYSTEM_CONSTANTS.lambda_4 },
+            ].map(({ key, label, icon, value }) => (
+              <div key={label} className="flex flex-col">
+                <label className="text-sm text-gray-700 mb-1 flex items-center">
+                  <span className="mr-2">{icon}</span>{label}
+                </label>
+                <input
+                  type="number"
+                  value={value}
+                  disabled
+                  className="border-gray-300 p-2 rounded-md text-sm bg-gray-100 w-full"
+                  aria-label={label}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+
+      <div className="flex justify-center mb-4">
+        <button
+          type="button"
+          onClick={saveCurrentResult}
+          className="bg-red-600 text-white font-semibold py-2 px-4 rounded-md hover:bg-red-700"
+          aria-label="儲存結果"
+        >
+          儲存結果
+        </button>
+      </div>
+
+      <div className="bg-white p-4 rounded-md shadow-md border-gray-100 mb-4">
+        <h2 className="font-semibold text-lg text-gray-800 mb-4">計算結果</h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <h3 className="font-semibold text-gray-700 mb-2">當前計算結果</h3>
+            <div className="space-y-2 text-sm">
+              <p>會心擊值 (c): {result.c}</p>
+              <p>會心率 (p_c): {result.p_c}</p>
+              <p>命中率 (r_h): {result.r_h}</p>
+              <p>格擋率 (r_b): {result.r_b}</p>
+              <p>會心實際率 (p_h): {result.p_h}</p>
+              <p>會心傷害倍率 (m_c): {result.m_c}</p>
+              <p>總倍率 (d_mul): {result.d_mul}</p>
+              <p>氣盾影響值 (G): {result.G}</p>
+              <p>最終攻擊力 (A): {result.A}</p>
+              <p>防禦減免率 (γ): {result.gamma}</p>
+              <p>元素抵抗率 (β): {result.beta}</p>
+              <p>基礎傷害: {result.baseDamage}</p>
+              <p>最終傷害: {result.finalDamage}</p>
+              <p>總減傷率: {result.totalReduction}</p>
+              <p>有效血量 (EHP): {result.ehp}</p>
+              <p>基礎元素傷害: {result.base_elementalDamage}</p>
+              <p>最終元素傷害: {result.elementalDamage}</p>
+              <p>基礎元素傷害比: {result.base_elementalDamagePrecentage}</p>
+              <p>最終元素傷害比: {result.elementalDamagePrecentage}</p>
+            </div>
+          </div>
+          {previousResult && (
+            <div>
+              <h3 className="font-semibold text-gray-700 mb-2">上次計算結果</h3>
+              <div className="space-y-2 text-sm">
+                <p>會心擊值 (c): {previousResult.c}</p>
+                <p>會心率 (p_c): {previousResult.p_c}</p>
+                <p>命中率 (r_h): {previousResult.r_h}</p>
+                <p>格擋率 (r_b): {previousResult.r_b}</p>
+                <p>會心實際率 (p_h): {previousResult.p_h}</p>
+                <p>會心傷害倍率 (m_c): {previousResult.m_c}</p>
+                <p>總倍率 (d_mul): {previousResult.d_mul}</p>
+                <p>氣盾影響值 (G): {previousResult.G}</p>
+                <p>最終攻擊力 (A): {previousResult.A}</p>
+                <p>防禦減免率 (γ): {previousResult.gamma}</p>
+                <p>元素抵抗率 (β): {previousResult.beta}</p>
+                <p>基礎傷害: {previousResult.baseDamage}</p>
+                <p>最終傷害: {previousResult.finalDamage}</p>
+                <p>總減傷率: {previousResult.totalReduction}</p>
+                <p>有效血量 (EHP): {previousResult.ehp}</p>
+                <p>基礎元素傷害: {previousResult.base_elementalDamage}</p>
+                <p>最終元素傷害: {previousResult.elementalDamage}</p>
+                <p>基礎元素傷害比: {previousResult.base_elementalDamagePrecentage}</p>
+                <p>最終元素傷害比: {previousResult.elementalDamagePrecentage}</p>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="bg-white p-4 rounded-md shadow-md border-gray-100">
+        <h2 className="font-semibold text-lg text-gray-800 mb-4">屬性收益圖表</h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <h3 className="font-semibold text-gray-700 mb-2">傷害增量</h3>
+            <ResponsiveContainer width="100%" height="40vh">
+              <LineChart data={deltaData} aria-label="傷害增量圖表">
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="point" label={{ value: "屬性值", position: "below" }} />
+                <YAxis tickFormatter={(value) => `${(value * 100).toFixed(2)}%`} label={{ value: "傷害增量 (%)", angle: -90, position: "left" }} />
+                <Tooltip content={<CustomTooltip isDelta={true} />} />
+                <Legend />
+                <Line type="default" dataKey="b_d" name="破防" stroke="#f00" />
+                <Line type="default" dataKey="b_e" name="忽視元素抵抗" stroke="#0f0" />
+                <Line type="default" dataKey="D" name="攻擊" stroke="#00f" />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+          <div>
+            <h3 className="font-semibold text-gray-700 mb-2">總傷害增益</h3>
+            <ResponsiveContainer width="100%" height="40vh">
+              <LineChart data={cumulativeData} aria-label="總傷害增益圖">
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="point" label={{ value: "屬性值", position: "below" }} />
+                <YAxis tickFormatter={(value) => `${(value * 100).toFixed(2)}%`} label={{ value: "總傷害增益 (%)", angle: "-90", position: "left" }} />
+                <Tooltip content={<CustomTooltip isDelta={false} />} />
+                <Legend />
+                <Line type="default" dataKey="b_d" name="破防" stroke="#f00" />
+                <Line type="default" dataKey="b_e" name="忽視元素抵抗" stroke="#0f0" />
+                <Line type="default" dataKey="D" name="攻擊" stroke="#00f" />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const HealingCalculator = () => {
+  const [inputs, setHealing] = useState({
+    healing_power: "0",
+    healing: "0",
+    flat: "0",
+    power_bonus: "0",
+  });
+  const [errorInputs, setErrors] = React.useState({});
+
+  const handleChange = (event) => {
+    const { name, value } = event.target;
+    if (value === '') {
+      setHealing((prev) => ({ ...prev, [name]: '0' }));
+      setErrors((prevResult) => ({ ...prevResult, [name]: '' }));
+      return;
+    }
+    const numericValue = parseFloat(value);
+    if (isNaN(numericValue)) {
+      setErrors((prevResult) => ({ ...prevResult, [name]: '請輸入有效數字' }));
+      return;
+    }
+    if (numericValue < 0) {
+      setErrors((prevResult) => ({ ...prevResult, [name]: '輸入值不能為負數' }));
+      return;
+    }
+    if (numericValue > 100000) {
+      setErrors((prevResult) => ({ ...prevResult, [name]: '輸入值過大，最大值100000' }));
+      return;
+    }
+    if (['healing_percent', 'healing_power_bonus'].includes(name)) {
+      if (numericValue < 0 || numericValue > 1) {
+        setErrors((prevResult) => ({ ...prevResult, [name]: '百分比值必須在0到1之間' }));
+        return;
+      }
+    }
+    setHealing((prev) => ({ ...prevResult, [name]: value }));
+    setErrors((prevResult) => ({ ...prevResult, [name]: '' }));
+  };
+
+  const calculateHealing = () => {
+    const healing_power_equip = toNum(inputs.healing_power_equip);
+    const healing_power = toNum(inputs.healing_power);
+    const base_healing = toNum(inputs.healing_base);
+    const healing_power_bonus = toNum(inputs.healing_power_bonus);
+
+    const total_healing_power = healing_power_equip + healing_power;
+    const final_healing = total_healing_power * (1 + healing_percent + healing_power_bonus);
+
+    return {
+      total_healing_power: total_healing_power.toFixed(2),
+      final_healing: final_healing.toFixed(2),
+    };
+  };
+
+  const result = calculateHealing();
+
+  return (
+    <div className="p-6 container mx-auto">
+      <div className="gradient-bg p-6 rounded-md shadow-md mb-6 text-center">
+        <h2 className="text-xl md:text-2xl font-semibold text-white">治療計算器</h2>
+        <p className="text-white text-opacity-80 text-sm mt-1">如有問題，請聯繫櫻桃白蘭地@永恆</p>
+      </div>
+
+      <div className="bg-white p-4 md:p-6 rounded-md shadow-md border-gray-100 mb-6">
+        <div className="flex items-center mb-4">
+          <div className="w-2 h-4 rounded-full bg-blue-500 mr-2"></div>
+          <h3 className="font-semibold text-base text-gray-800">輸入參數</h3>
+        </div>
+        <ImageUploader setInputs={setInputs} type="heal" />
+        <div className="grid grid-cols-1 gap-2">
+          {[
+            { key: "healing_power_equip", label: "裝備治療強度", icon: "🩺" },
+            { key: "healing_power", label: "基礎治療強度", icon: "💉" },
+            { key: "healing_percent", label: "治療加成%", icon: "📈", tooltip: "除以100，例如10%，輸入0.1" },
+            { key: "healing_power_bonus", label: "額外治療加成%", icon: "📈", tooltip: "除以100，例如5%，輸入0.05" },
+          ].map(({ key, label, icon, tooltip }) => (
+            <div key={label} className="flex flex-col group relative">
+              <label className="text-sm text-gray-700 mb-1 flex items-center">
+                <span className="mr-2">{icon}</span>{label}
+                {tooltip && (
+                  <>
+                    <span className="flex items-center justify-center w-4 h-4 bg-gray-200 rounded-full text-white text-xs cursor-pointer ml-2">?</span>
+                    <div className="tooltip-content absolute left-0 top-8 bg-white text-gray-900 text-xs p-2 rounded shadow-md hidden group-hover-md:block max-w-xs ml-2">
+                      {tooltip}
+                    </div>
+                  </>
+                )}
+              </label>
+              <input
+                type="number"
+                name={key}
+                value={inputs[key]}
+                onChange={handleChange}
+                min="0"
+                max="10000"
+                className={`input-field border ${inputErrors[key] ? 'border-red-500' : 'border-gray-300'}`} rounded-md p-2 text-sm w-full`}
+                aria-label={label}
+              />
+              {inputErrors[key] && (
+                <p className="text-sm text-red-600 mt-1">{inputErrors[key]}</p>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="bg-white rounded-md shadow-md p-4 md:p-6">
+        <h2 className="font-semibold text-lg text-gray-800 mb-1">計算結果</h2>
+        <div className="space-y-2 text-sm">
+          <p>總治療效果: {result.total_healing_power}</p>
+          <p>最終治療量: {result.final_healing}</p>
+        </div>
+      </div>
+    );
+};
+
+const App = () => {
+  const [activeTab, setTab] = React.useState('defense');
+  const [isSidebarOpen, setSidebarOpen] = React.useState(false);
+
+  const toggleSidebar = () => {
+    setSidebarOpen(!isSidebarOpen);
+  };
+
+  return (
+    <div className="relative">
+      <button
+        className="md:hidden fixed top-4 left-4 z-50 bg-red-500 text-white p-2 rounded-lg"
+        onClick={toggleSidebar}
+        aria-label="開關側邊欄"
+      >
+        ☰
+      </button>
+
+      <div className={`sidebar fixed top-0 left-0 h-full w-64 bg-white shadow-lg p-4 transform ${isSidebarOpen ? 'open' : ''} md:transform-none z-40`}>
+        <div className="flex items-center mb-6">
+          <div className="w-2 h-6 rounded-full bg-red-500 mr-2"></div>
+          <h2 className="text-xl font-semibold text-gray-800">遊戲計算器</h2>
+        </div>
+        <nav className="space-y-2">
+          <button
+            className={`w-full text-left py-2 px-4 rounded-lg ${activeTab === 'defense' ? 'bg-red-100 text-red-700' : 'text-gray-600 hover:bg-gray-100'}`}
+            onClick={() => { setTab('defense'); setSidebarOpen(false); }}
+            aria-label="切換到防守計算器"
+          >
+            防守計算器
+          </button>
+          <button
+            className={`w-full text-left py-2 px-4 rounded-lg ${activeTab === 'attack' ? 'bg-red-100 text-red-700' : 'text-gray-600 hover:bg-gray-100'}`}
+            onClick={() => { setTab('attack'); setSidebarOpen(false); }}
+            aria-label="切換到攻擊計算器"
+          >
+            攻擊計算器
+          </button>
+          <button
+            className={`w-full text-left py-2 px-4 rounded-lg ${activeTab === 'healing' ? 'bg-red-100 text-red-700' : 'text-gray-600 hover:bg-gray-100'}`}
+            onClick={() => { setTab('healing'); setSidebarOpen(false); }}
+            aria-label="切換到治療計算器"
+          >
+            治療計算器
+          </button>
+        </nav>
+      </div>
+
+      <div className="md:ml-64 p-4">
+        {activeTab === 'defense' && <DamageCalculator />}
+        {activeTab === 'attack' && <DamageCalculator2 />}
+        {activeTab === 'healing' && <HealingCalculator />}
+      </div>
+    </div>
+  );
+};
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
